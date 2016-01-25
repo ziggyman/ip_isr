@@ -20,11 +20,14 @@
 # see <http://www.lsstcorp.org/LegalNotices/>.
 #
 import math
+import numpy
+
 import lsst.afw.geom as afwGeom
 import lsst.afw.image as afwImage
 import lsst.meas.algorithms as measAlg
 import lsst.pex.config as pexConfig
 import lsst.pipe.base as pipeBase
+import lsst.afw.math as afwMath
 from lsstDebug import getDebugFrame
 from lsst.afw.display import getDisplay
 from . import isr
@@ -33,6 +36,7 @@ from .assembleCcdTask import AssembleCcdTask
 from .fringe import FringeTask
 from lsst.afw.geom.polygon import Polygon
 from lsst.afw.cameraGeom import PIXELS, FOCAL_PLANE
+from contextlib import contextmanager
 
 class IsrTaskConfig(pexConfig.Config):
     doBias = pexConfig.Field(
@@ -168,6 +172,33 @@ class IsrTaskConfig(pexConfig.Config):
         dtype = bool,
         default = True,
         doc = "Assemble amp-level exposures into a ccd-level exposure?"
+        )
+    doBrighterFatter = pexConfig.Field(
+        dtype = bool,
+        default = False,
+        doc = "Apply the brighter fatter correction"
+        )
+    brighterFatterKernelFile = pexConfig.Field(
+        dtype = str,
+        default = '',
+        doc = "Kernel file used for the brighter fatter correction"
+        )
+    brighterFatterMaxIter = pexConfig.Field(
+        dtype = int,
+        default = 10,
+        doc = "Maximum number of iterations for the brighter fatter correction"
+        )
+    brighterFatterThreshold = pexConfig.Field(
+        dtype = float,
+        default = 1000,
+        doc = "Threshold used to stop iterating the brighter fatter correction.  It is the "
+        " absolute value of the difference between the current corrected image and the one"
+        " from the previous iteration summed over all the pixels."
+        )
+    brighterFatterApplyGain = pexConfig.Field(
+        dtype = bool,
+        default = True,
+        doc = "Should the gain be applied when applying the brighter fatter correction?"
         )
 
 ## \addtogroup LSST_task_documentation
@@ -329,6 +360,11 @@ class IsrTask(pipeBase.CmdLineTask):
         self.makeSubtask("assembleCcd")
         self.makeSubtask("fringe")
 
+        if self.config.doBrighterFatter:
+            import cPickle as pickle
+            kernelFile = self.config.brighterFatterKernelFile
+            with open(kernelFile) as f:
+                self.brighterFatterKernel = pickle.load(f)
 
     def readIsrData(self, dataRef, rawExposure):
         """!Retrieve necessary frames for instrument signature removal
@@ -418,6 +454,13 @@ class IsrTask(pipeBase.CmdLineTask):
 
         if self.config.doBias:
             self.biasCorrection(ccdExposure, bias)
+
+        if self.config.doBrighterFatter:
+            self.brighterFatterCorrection(ccdExposure, self.brighterFatterKernel,
+                                          self.config.brighterFatterMaxIter,
+                                          self.config.brighterFatterThreshold,
+                                          self.config.brighterFatterApplyGain,
+                                          )
 
         if self.config.doDark:
             self.darkCorrection(ccdExposure, dark)
@@ -691,6 +734,116 @@ class IsrTask(pipeBase.CmdLineTask):
         ccdPoints = [ccd.transform(ccd.makeCameraPoint(x, FOCAL_PLANE), PIXELS).getPoint() for x in intersect]
         validPolygon = Polygon(ccdPoints)
         ccdExposure.getInfo().setValidPolygon(validPolygon)
+
+    def brighterFatterCorrection(self, exposure, kernel, maxIter, threshold, applyGain):
+        """Apply brighter fatter correction in place for the image
+
+        This correction takes a kernel that has been derived from flat field images to
+        redistribute the charge.  The gradient of the kernel is the deflection
+        field due to the accumulated charge.
+
+        Given the orinal image I(x) and the kernel K(x) we can computee the corrected image  Ic(x)
+        using the following equation:
+
+        Ic(x) = I(x) + 0.5*d/dx(I(x)*d/dx(int( dy*K(x-y)*I(y))))
+
+        To evaluate the derivative term we expand it as follows:
+
+        0.5 * ( d/dx(I(x))*d/dx(int(dy*K(x-y)*I(y))) + I(x)*d^2/dx^2(int(dy* K(x-y)*I(y))) )
+
+        Because we use the measured counts instead of the incident counts we apply the correction
+        iteratively to reconstruct the original counts and the correction.  We stop iterating when the
+        summed difference between the current corrected image and the one from the previous iteration
+        is below the threshold.  We do not require convergence because the number of iterations is
+        to large a computational cost.  How we define the threshold still needs to be evaluated, the
+        current default was shown to work reasonably well on a small set of images.
+
+        The edges as defined by the kernel are not corrected because they have spurious values
+        due to the convolution.
+        """
+        self.log.info("Applying brighter fatter correction")
+
+        image = exposure.getMaskedImage().getImage()
+
+        # The image needs to be units of electrons/holes
+        with self.gainContext(exposure, image, applyGain) as exp:
+
+            kLx = numpy.shape(kernel)[0]
+            kLy = numpy.shape(kernel)[1]
+            kernelImage = afwImage.ImageD(kLx, kLy)
+            kernelImage.getArray()[:,:] = kernel
+            tempImage = image.clone()
+
+            nanIndex = numpy.isnan(tempImage.getArray())
+            tempImage.getArray()[nanIndex] = 0.
+
+            outImage = afwImage.ImageF(image.getDimensions())
+            corr = numpy.zeros_like(image.getArray())
+            prev_image = numpy.zeros_like(image.getArray())
+            convCntrl = afwMath.ConvolutionControl(False, True, 1)
+            fixedKernel = afwMath.FixedKernel(kernelImage)
+
+            # Define boundary by convolution region.  The region that the correction will be
+            # calculated for is one fewer in each dimension because of the second derivate terms.
+            startX = kLx/2
+            endX = -kLx/2
+            startY = kLy/2
+            endY = -kLy/2
+
+            for iteration in range(maxIter):
+
+                afwMath.convolve(outImage, tempImage, fixedKernel, convCntrl)
+                tmpArray = tempImage.getArray()
+                outArray = outImage.getArray()
+
+                # First derivative term
+                gradTmp = numpy.gradient(tmpArray[startY:endY,startX:endX])
+                gradOut = numpy.gradient(outArray[startY:endY,startX:endX])
+                first = (gradTmp[0]*gradOut[0] + gradTmp[1]*gradOut[1])[1:-1,1:-1]
+
+                # Second derivative term
+                diffOut20 = numpy.diff(outArray,2,0)[startY:endY, startX+1:endX-1]
+                diffOut21 = numpy.diff(outArray,2,1)[startY+1:endY-1, startX:endX]
+                second = tmpArray[startY+1:endY-1, startX+1:endX-1]*(diffOut20 + diffOut21)
+
+                corr[startY+1:endY-1, startX+1:endX-1] = 0.5*(first + second)
+
+                # reset tmp image and apply correction
+                tmpArray[:,:] = image.getArray()[:,:]
+                tmpArray[nanIndex] = 0.
+                tmpArray[startY:endY, startX:endX] += corr[startY:endY,startX:endX]
+
+                if iteration > 0:
+                    diff = numpy.sum(numpy.abs(prev_image - tmpArray))
+
+                    if diff < threshold:
+                        break
+                    prev_image[:,:] = tmpArray[:,:]
+
+            if iteration == maxIter -1:
+                self.log.warn("Brighter fatter correcton did not converge, final difference %f" % diff)
+
+            self.log.info("Finished brighter fatter in %d iterations" % (iteration + 1))
+            image.getArray()[startY+1:endY-1, startX+1:endX-1] += corr[startY+1:endY-1, startX+1:endX-1]
+
+    @contextmanager
+    def gainContext(self, exp, image, apply):
+        """Context manager that applies and removes gain
+        """
+        if apply:
+            ccd = exp.getDetector()
+            for amp in ccd:
+                sim = image.Factory(image, amp.getBBox())
+                sim *= amp.getGain()
+
+        try:
+            yield exp
+        finally:
+            if apply:
+                ccd = exp.getDetector()
+                for amp in ccd:
+                    sim = image.Factory(image, amp.getBBox())
+                    sim /= amp.getGain()
 
 class FakeAmp(object):
     """A Detector-like object that supports returning gain and saturation level"""
