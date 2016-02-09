@@ -443,7 +443,8 @@ class IsrTask(pipeBase.CmdLineTask):
         if self.config.doFringe and self.config.fringeAfterFlat:
             self.fringe.run(ccdExposure, **fringes.getDict())
 
-        ccdExposure.getCalib().setFluxMag0(self.config.fluxMag0T1 * ccdExposure.getCalib().getExptime())
+        if False:               # RHL XXX  This scalar/dict disagreement needs to get resolved between HSC and LSST (i.e. Paul and Lauren).  Do not check me in
+            ccdExposure.getCalib().setFluxMag0(self.config.fluxMag0T1 * ccdExposure.getCalib().getExptime())
 
         frame = getDebugFrame(self._display, "postISRCCD")
         if frame:
